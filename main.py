@@ -20,12 +20,12 @@ class BrowserSession:
 session = BrowserSession()
 
 def log(text):
+    """Python Logs"""
     print(f"[LOG] {text}", flush=True)
 
 # --- Startup & Shutdown Logic ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: Browser Launch karo
     log("🔵 STARTING ASYNC BROWSER SESSION...")
     session.playwright = await async_playwright().start()
     
@@ -45,10 +45,17 @@ async def lifespan(app: FastAPI):
     )
     
     session.page = await session.context.new_page()
+
+    # --- BROWSER CONSOLE LOGS KO PYTHON ME PRINT KARNA ---
+    # Ye bohot zaroori hai debugging ke liye
+    session.page.on("console", lambda msg: print(f"[BROWSER-JS] {msg.text}", flush=True))
     
     log("   👉 Loading https://chatgptfree.ai/chat/ ...")
-    await session.page.goto("https://chatgptfree.ai/chat/", timeout=120000, wait_until="domcontentloaded")
-    
+    try:
+        await session.page.goto("https://chatgptfree.ai/chat/", timeout=120000, wait_until="domcontentloaded")
+    except Exception as e:
+        log(f"   ⚠️ Goto Timeout (might be ok): {e}")
+
     # Cloudflare Check
     selector = f"#aipkit_chat_container_{session.bot_id}"
     try:
@@ -56,50 +63,53 @@ async def lifespan(app: FastAPI):
         await session.page.wait_for_selector(selector, state="attached", timeout=60000)
         log("   ✅ Website Loaded & Cloudflare Passed!")
     except Exception as e:
-        log(f"   ❌ Timeout waiting for selector. HTML dump below:")
+        log(f"   ❌ Timeout waiting for selector. Dumping HTML Snippet:")
         content = await session.page.content()
-        log(content[:500]) # First 500 chars
+        log(content[:1000]) # First 1000 chars print karo taake pata chale kya khula hai
     
-    yield # Yahan app chalegi
+    yield
     
-    # Shutdown: Browser band karo
     log("🔴 SHUTTING DOWN BROWSER...")
-    await session.browser.close()
-    await session.playwright.stop()
+    if session.browser:
+        await session.browser.close()
+    if session.playwright:
+        await session.playwright.stop()
 
 app = FastAPI(lifespan=lifespan)
 
 # --- Browser-Native Fetch Logic ---
 async def execute_browser_request(message):
-    """
-    Ye function Python se request nahi bhejta.
-    Ye Browser ke andar JS inject karta hai jo wahan se fetch karti hai.
-    Is se Cloudflare 403 nahi de sakta kyunke request browser ke andar se ja rahi hai.
-    """
     
-    # 1. Get Nonce from Page (Fresh every time)
+    # 1. Get Nonce
     log("   👉 Extracting Nonce from Page...")
-    nonce_script = f"""
-    () => {{
-        const div = document.querySelector('#aipkit_chat_container_{session.bot_id}');
-        if (!div) return null;
-        const config = JSON.parse(div.getAttribute('data-config'));
-        return config.nonce;
-    }}
-    """
-    nonce = await session.page.evaluate(nonce_script)
-    if not nonce:
-        raise Exception("Nonce not found on page")
-    log(f"   🔑 Nonce: {nonce}")
+    try:
+        nonce_script = f"""
+        () => {{
+            const div = document.querySelector('#aipkit_chat_container_{session.bot_id}');
+            if (!div) return null;
+            const config = JSON.parse(div.getAttribute('data-config'));
+            return config.nonce;
+        }}
+        """
+        nonce = await session.page.evaluate(nonce_script)
+        if not nonce:
+            log("   ❌ Nonce is NULL. Dumping Page Content for debugging...")
+            content = await session.page.content()
+            log(content[:500])
+            raise Exception("Nonce not found on page")
+        log(f"   🔑 Nonce: {nonce}")
+    except Exception as e:
+        raise Exception(f"Nonce Extraction Failed: {e}")
 
     client_msg_id = f"aipkit-client-msg-{session.bot_id}-{int(time.time()*1000)}-{uuid.uuid4().hex[:5]}"
 
-    # 2. JS Injection: POST & GET Stream Handler
-    # Hum poora logic JS me likh kar browser ko denge
+    # 2. JS Injection (With HARD LOGGING)
     log("🚀 EXECUTING JS FETCH INSIDE BROWSER...")
     
     js_logic = """
     async ({ message, nonce, bot_id, client_id }) => {
+        console.log("--- JS STARTING ---");
+        
         // --- STEP 1: POST ---
         const formData = new FormData();
         formData.append('action', 'aipkit_cache_sse_message');
@@ -108,15 +118,50 @@ async def execute_browser_request(message):
         formData.append('bot_id', bot_id);
         formData.append('user_client_message_id', client_id);
 
-        const postResp = await fetch('https://chatgptfree.ai/wp-admin/admin-ajax.php', {
-            method: 'POST',
-            body: formData
-        });
+        console.log("Sending POST to admin-ajax.php...");
         
-        const postJson = await postResp.json();
-        if (!postJson.success) return { error: "POST Failed", details: postJson };
+        let postResp;
+        try {
+            postResp = await fetch('https://chatgptfree.ai/wp-admin/admin-ajax.php', {
+                method: 'POST',
+                body: formData,
+                headers: {
+                    'X-Requested-With': 'XMLHttpRequest' // Ye header zaroori hota hai WordPress ajax ke liye
+                }
+            });
+        } catch (err) {
+            console.error("Fetch Network Error:", err);
+            return { error: "Network Error", details: err.toString() };
+        }
+
+        console.log("POST Status:", postResp.status);
+        
+        // RAW TEXT READ KARO (Crash se bachne ke liye)
+        const rawText = await postResp.text();
+        console.log("Raw Response Length:", rawText.length);
+        
+        // Agar response chhota hai to print kar do, bara hai to shuru ka hissa
+        if (rawText.length < 500) {
+            console.log("Raw Body:", rawText);
+        } else {
+            console.log("Raw Body Start:", rawText.substring(0, 500));
+        }
+
+        let postJson;
+        try {
+            postJson = JSON.parse(rawText);
+        } catch (e) {
+            console.error("JSON Parse Failed! Server returned HTML/String instead of JSON.");
+            return { error: "JSON Parse Failed", raw_response: rawText };
+        }
+        
+        if (!postJson.success) {
+            console.error("API returned success: false");
+            return { error: "API Success False", details: postJson };
+        }
         
         const cacheKey = postJson.data.cache_key;
+        console.log("Got Cache Key:", cacheKey);
 
         // --- STEP 2: GET STREAM ---
         const params = new URLSearchParams({
@@ -130,7 +175,9 @@ async def execute_browser_request(message):
             "_ajax_nonce": nonce
         });
 
+        console.log("Starting EventStream...");
         const streamResp = await fetch(`https://chatgptfree.ai/wp-admin/admin-ajax.php?${params.toString()}`);
+        
         const reader = streamResp.body.getReader();
         const decoder = new TextDecoder();
         let finalReply = "";
@@ -150,11 +197,11 @@ async def execute_browser_request(message):
                 }
             }
         }
+        console.log("Stream Complete. Final Length:", finalReply.length);
         return { success: true, reply: finalReply };
     }
     """
 
-    # Execute JS
     result = await session.page.evaluate(js_logic, {
         "message": message,
         "nonce": nonce,
@@ -163,6 +210,7 @@ async def execute_browser_request(message):
     })
 
     if "error" in result:
+        # Error return karo taake log me nazar aye ke masla kya tha (HTML ya JSON)
         raise Exception(f"JS Error: {result}")
     
     return result["reply"]
@@ -171,26 +219,25 @@ async def execute_browser_request(message):
 async def chat_endpoint(message: str = Query(..., description="User message")):
     log(f"📨 REQUEST: {message}")
     
-    # Agar browser band ho to restart karo
     if not session.page or session.page.is_closed():
-        log("⚠️ Browser was closed. Restarting...")
-        # (Yahan reload logic simple rakha hai, ideally lifespan restart hona chahiye)
-        # For simplicity, we assume browser stays open via lifespan.
-        return {"error": "Browser crashed, please redeploy or restart container."}
+        return {"error": "Browser crashed or closed."}
 
     try:
         reply = await execute_browser_request(message)
-        log(f"🎉 RESPONSE LENGTH: {len(reply)}")
         return {"response": reply, "status": "success"}
     
     except Exception as e:
-        log(f"❌ ERROR: {e}")
-        # Agar page crash ho gya ho to reload kar lo
+        log(f"❌ Python Error Catch: {e}")
+        
+        # Agar error aya hai, to browser shayad stuck ho, reload kar lo
         try:
-            log("🔄 Reloading Page...")
+            log("🔄 Reloading Page to refresh tokens...")
             await session.page.reload()
-        except:
-            pass
+            # Reload ke baad dubara wait karo element ka
+            await session.page.wait_for_selector(f"#aipkit_chat_container_{session.bot_id}", state="attached", timeout=30000)
+        except Exception as reload_e:
+            log(f"   ❌ Reload failed: {reload_e}")
+
         return {"error": str(e), "status": "failed"}
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 fastapi
 uvicorn
-requests
+curl-cffi
 playwright
 beautifulsoup4

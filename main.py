@@ -1,5 +1,5 @@
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, Query
 import requests
 from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
@@ -21,49 +21,82 @@ SESSION = {
 }
 
 def log(text):
-    """Railway logs me foran print karne ke liye helper function"""
+    """Logs print karne ke liye helper function"""
     print(f"[LOG] {text}", flush=True)
 
 def refresh_session():
-    """Headless browser chala kar nayi Cookies aur Nonce layega (Detailed Logging)"""
+    """Headless browser chala kar nayi Cookies aur Nonce layega"""
     log("🔵 STARTING BROWSER SESSION REFRESH...")
     try:
         with sync_playwright() as p:
-            log("   👉 Launching Chromium...")
-            browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+            log("   👉 Launching Chromium Browser...")
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-blink-features=AutomationControlled"
+                ]
+            )
             context = browser.new_context(
                 user_agent="Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Mobile Safari/537.36"
             )
             page = context.new_page()
 
-            log("   👉 Navigating to https://chatgptfree.ai/chat/ ...")
-            page.goto("https://chatgptfree.ai/chat/", timeout=90000)
+            log("   👉 Navigating to URL...")
+            try:
+                response = page.goto("https://chatgptfree.ai/chat/", timeout=60000, wait_until="domcontentloaded")
+                log(f"   📄 Page Status Code: {response.status if response else 'Unknown'}")
+                log(f"   📄 Page Title: {page.title()}")
+            except Exception as e:
+                log(f"   ❌ Navigation Error: {str(e)}")
+                # Agar timeout ho jaye tab bhi html check karo, shayad load ho chuka ho
             
+            # Selector Definition
             selector = f"#aipkit_chat_container_{SESSION['bot_id']}"
-            log(f"   👉 Waiting for selector: {selector} (Cloudflare Check)...")
+            log(f"   👉 Looking for selector: {selector} in DOM (Hidden or Visible)...")
             
             try:
-                page.wait_for_selector(selector, timeout=60000)
-                log("   ✅ Website Loaded & Selector Found!")
+                # YAHAN CHANGE KIA HAI: state="attached" (Hidden element ko bhi dhoond le ga)
+                page.wait_for_selector(selector, state="attached", timeout=30000)
+                log("   ✅ Target Element Found in DOM!")
             except Exception as e:
-                log(f"   ❌ Selector Timeout! Cloudflare might have blocked us. Error: {e}")
+                log(f"   ❌ Selector Timeout! Dumping HTML snippet for debugging...")
+                content = page.content()
+                log(f"   📜 HTML DUMP (First 1000 chars): {content[:1000]}")
+                log(f"   📜 HTML DUMP (Last 1000 chars): {content[-1000:]}")
                 browser.close()
                 return False
 
-            # Extract Data
+            # HTML Extract
             html = page.content()
             soup = BeautifulSoup(html, 'html.parser')
+            
+            # Find Div specifically
             chat_div = soup.find("div", {"id": f"aipkit_chat_container_{SESSION['bot_id']}"})
             
             if not chat_div:
-                log("   ❌ Chat container div not found in HTML!")
+                log("   ❌ Soup failed to find div, even though Playwright saw it.")
                 browser.close()
                 return False
 
-            log("   👉 Extracting Config Data...")
-            config_data = json.loads(chat_div['data-config'])
-            nonce = config_data.get('nonce')
-            log(f"   🔑 NONCE FOUND: {nonce}")
+            log("   👉 Extracting 'data-config' attribute...")
+            try:
+                config_raw = chat_div.get('data-config')
+                log(f"   📄 Raw Config Data Found: {config_raw[:100]}...") # Sirf shuru ka hissa print karega
+                config_data = json.loads(config_raw)
+                nonce = config_data.get('nonce')
+                
+                if not nonce:
+                    log("   ❌ Nonce is missing in data-config!")
+                    browser.close()
+                    return False
+                    
+                log(f"   🔑 NONCE EXTRACTED: {nonce}")
+            except Exception as e:
+                log(f"   ❌ JSON Parsing Error: {e}")
+                browser.close()
+                return False
 
             # Extract Cookies
             cookies = context.cookies()
@@ -85,7 +118,7 @@ def refresh_session():
         return False
 
 def make_api_request(message):
-    """Ye function pehle POST karega phir GET stream karega (Detailed Logging)"""
+    """Ye function pehle POST karega phir GET stream karega"""
     
     url = "https://chatgptfree.ai/wp-admin/admin-ajax.php"
     client_msg_id = f"aipkit-client-msg-{SESSION['bot_id']}-{int(time.time()*1000)}-{uuid.uuid4().hex[:5]}"
@@ -97,7 +130,6 @@ def make_api_request(message):
         "X-Requested-With": "XMLHttpRequest"
     }
 
-    # --- STEP 1: POST Request ---
     files = {
         'action': (None, 'aipkit_cache_sse_message'),
         'message': (None, message),
@@ -110,16 +142,14 @@ def make_api_request(message):
     try:
         post_response = requests.post(url, cookies=SESSION["cookies"], headers=headers, files=files, timeout=15)
         log(f"   👉 POST Status Code: {post_response.status_code}")
-        
+        log(f"   👉 POST Response Text: {post_response.text}") # Raw Response check karo
+
         if post_response.status_code != 200:
-            log(f"   ❌ POST Failed Response: {post_response.text}")
             raise Exception(f"POST Error: {post_response.status_code}")
             
         post_json = post_response.json()
-        log(f"   👉 POST Response JSON: {post_json}")
-
         if not post_json.get("success"):
-            log("   ❌ POST Success is False. Cookies might be dead.")
+            log("   ❌ POST Success is False.")
             raise Exception("POST Success False")
             
         cache_key = post_json["data"]["cache_key"]
@@ -139,11 +169,8 @@ def make_api_request(message):
 
         log("📡 SENDING GET STREAM REQUEST (Step 2)...")
         stream_response = requests.get(url, cookies=SESSION["cookies"], headers=headers, params=params, stream=True, timeout=20)
-        log(f"   👉 Stream Status Code: {stream_response.status_code}")
-
-        full_reply = ""
-        chunk_count = 0
         
+        full_reply = ""
         for line in stream_response.iter_lines():
             if line:
                 decoded_line = line.decode('utf-8')
@@ -152,15 +179,8 @@ def make_api_request(message):
                     try:
                         data_chunk = json.loads(json_str)
                         if "delta" in data_chunk:
-                            chunk_text = data_chunk["delta"]
-                            full_reply += chunk_text
-                            chunk_count += 1
-                            # Har 5 chunks ke baad log karo taake spam na ho
-                            if chunk_count % 5 == 0:
-                                log(f"   ⬇️ Receiving chunks... (Total chars: {len(full_reply)})")
-                        
+                            full_reply += data_chunk["delta"]
                         if data_chunk.get("finished", False) is True:
-                            log("   ✅ Stream Finished flag received.")
                             break
                     except:
                         pass
@@ -180,32 +200,26 @@ def make_api_request(message):
 def chat_endpoint(message: str = Query(..., description="User message")):
     log(f"📨 NEW USER REQUEST: message='{message}'")
     
-    # 1. Check Session
     if not SESSION["cookies"]:
         log("⚠️ No session found. Initializing first login...")
         success = refresh_session()
         if not success:
-            log("❌ Initial login failed.")
-            return {"error": "Failed to initialize session", "logs": "Check Railway console"}
+            return {"error": "Failed to initialize session", "status": "failed"}
 
     try:
-        # 2. Try Request
         reply = make_api_request(message)
         return {"response": reply, "status": "success"}
     
     except Exception as e:
-        log("⚠️ Request failed. Assuming cookies expired. RETRYING...")
-        # 3. Retry Logic
+        log("⚠️ Request failed. Retrying with fresh session...")
         refresh_success = refresh_session()
         if not refresh_success:
              return {"error": "Failed to refresh session", "status": "failed"}
              
         try:
-            log("🔄 Retrying API Request with new session...")
             reply = make_api_request(message)
             return {"response": reply, "status": "success"}
         except Exception as final_e:
-            log(f"❌ Retry also failed: {final_e}")
             return {"error": str(final_e), "status": "failed"}
 
 if __name__ == "__main__":
